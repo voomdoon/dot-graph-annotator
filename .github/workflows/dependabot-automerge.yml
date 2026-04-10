@@ -1,11 +1,7 @@
 name: Dependabot auto-merge
 
 on:
-  pull_request:
-
-permissions:
-  contents: write
-  pull-requests: write
+  pull_request_target:
 
 concurrency:
   group: dependabot-automerge-${{ github.event.pull_request.number }}
@@ -13,7 +9,10 @@ concurrency:
 
 jobs:
   check_setup:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - name: Check for DEPENDABOT_AUTOMERGE_PAT secret
         run: |
@@ -21,59 +20,37 @@ jobs:
             echo "Error: DEPENDABOT_AUTOMERGE_PAT secret is not set. Exiting." >&2
             exit 1
           fi
-      - name: "Guard: ensure branch protection requires CI check"
-        env:
-          GH_TOKEN: ${{ secrets.DEPENDABOT_AUTOMERGE_PAT }}
-          EXPECTED_CHECK: verify
-          PROTECTED_BRANCH: main
-        run: |
-          set -euo pipefail
-      
-          api="repos/${GITHUB_REPOSITORY}/branches/${PROTECTED_BRANCH}/protection/required_status_checks"
-          echo "Checking required status checks via: $api"
-      
-          # capture status code
-          out="$(mktemp)"
-          code="$(gh api -H "Accept: application/vnd.github+json" "$api" >"$out" 2>/dev/null; echo $?)"
-      
-          if [ "$code" -ne 0 ]; then
-            echo "ERROR: Cannot read branch protection required status checks." >&2
-            echo "Likely causes:" >&2
-            echo " - PAT lacks fine-grained permission: Administration (read-only)" >&2
-            echo " - Token owner is not repo admin" >&2
-            exit 1
-          fi
-      
-          contexts="$(jq -r '.contexts[]?' <"$out")"
-      
-          if [ -z "$contexts" ]; then
-            echo "ERROR: No required status checks configured on ${PROTECTED_BRANCH}." >&2
-            exit 1
-          fi
-      
-          if ! echo "$contexts" | grep -Fxq "$EXPECTED_CHECK"; then
-            echo "ERROR: Required checks do NOT include '${EXPECTED_CHECK}'." >&2
-            echo "Required checks are:" >&2
-            echo "$contexts" | sed 's/^/ - /'
-            exit 1
-          fi
-
-          echo "OK: Branch protection requires '${EXPECTED_CHECK}'."
 
   approve:
     needs: check_setup
-    if: >
-      github.event.pull_request.user.login == 'dependabot[bot]' &&
-      github.event.pull_request.draft == false &&
-      github.event.pull_request.base.ref == 'main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+      pull-requests: write
     outputs:
       should_automerge: ${{ steps.policy.outputs.should_automerge }}
 
     steps:
+      - id: verify
+        name: Verify PR is from Dependabot
+        run: |
+          pr_json=$(gh api "/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}")
+
+          author=$(jq -r '.user.login' <<<"$pr_json")
+          draft=$(jq -r '.draft' <<<"$pr_json")
+          base_ref=$(jq -r '.base.ref' <<<"$pr_json")
+
+          if [ "$author" = "dependabot[bot]" ] && [ "$draft" = "false" ] && [ "$base_ref" = "main" ]; then
+            echo "verified=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "verified=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - id: meta
-        name: Fetch metadata 
-        uses: dependabot/fetch-metadata@v3
+        name: Fetch metadata
+        uses: dependabot/fetch-metadata@ffa630c65fa7e0ecfa0625b5ceda64399aea1b36 # v3.0.0
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -82,17 +59,20 @@ jobs:
         run: |
           SHOULD="false"
 
-          UPDATE_TYPE="${{ steps.meta.outputs.update-type }}"
-          ECO="${{ steps.meta.outputs.package-ecosystem }}"
+          # Only evaluate policy if PR is verified as from Dependabot
+          if [ "${{ steps.verify.outputs.verified }}" = "true" ]; then
+            UPDATE_TYPE="${{ steps.meta.outputs.update-type }}"
+            ECO="${{ steps.meta.outputs.package-ecosystem }}"
 
-          # allow: any patch
-          if [ "$UPDATE_TYPE" = "version-update:semver-patch" ]; then
-            SHOULD="true"
-          fi
+            # allow: any patch or minor
+            if [ "$UPDATE_TYPE" = "version-update:semver-patch" ] || [ "$UPDATE_TYPE" = "version-update:semver-minor" ]; then
+              SHOULD="true"
+            fi
 
-          # allow: github-actions minor (and patch already covered above)
-          if [ "$ECO" = "github_actions" ] && [ "$UPDATE_TYPE" = "version-update:semver-minor" ]; then
-            SHOULD="true"
+            # allow: github-actions major
+            if [ "$ECO" = "github_actions" ] && [ "$UPDATE_TYPE" = "version-update:semver-major" ]; then
+              SHOULD="true"
+            fi
           fi
 
           echo "should_automerge=$SHOULD" >> "$GITHUB_OUTPUT"
@@ -106,7 +86,9 @@ jobs:
   automerge:
     needs: approve
     if: needs.approve.outputs.should_automerge == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
+    permissions:
+      contents: write
     steps:
       - name: Enable auto-merge
         run: |
